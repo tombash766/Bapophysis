@@ -30,6 +30,73 @@ pub struct Gpu {
     pub pending: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 impl Gpu {
+    pub fn clear_histogram(&self) {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.clear_buffer(&self.histogram, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+    }
+    pub fn verify_variations(&self) -> Vec<[f32; 2]> {
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Variation verification"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("flame.wgsl").into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&self.pipeline.get_bind_group_layout(0)],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("check_variations"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: self.particles.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &self.bindings, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.particles, 0, &output, 0, output.size());
+        self.queue.submit(Some(encoder.finish()));
+        let (tx, rx) = mpsc::channel();
+        output.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let result = {
+            let data = output.slice(..).get_mapped_range();
+            bytemuck::cast_slice::<u8, [u32; 8]>(&data)
+                .iter()
+                .take(crate::settings::VARIATION_COUNT * 2)
+                .map(|p| [f32::from_bits(p[0]), f32::from_bits(p[1])])
+                .collect()
+        };
+        output.unmap();
+        result
+    }
+    pub fn resized(&self, width: u32, height: u32) -> Self {
+        Self::new(self.device.clone(), self.queue.clone(), width, height)
+    }
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, width: u32, height: u32) -> Self {
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Flame parameters"),
@@ -39,7 +106,9 @@ impl Gpu {
         let particles = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Independent orbits"),
             contents: bytemuck::cast_slice(&initial_particles()),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let histogram = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Density"),
@@ -110,8 +179,11 @@ impl Gpu {
         self.queue.submit(Some(encoder.finish()));
     }
     pub fn dispatch(&mut self) {
+        self.dispatch_batches(1);
+    }
+    pub fn dispatch_batches(&mut self, batches: u32) {
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
+        for _ in 0..batches {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None,

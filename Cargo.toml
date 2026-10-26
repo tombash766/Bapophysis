@@ -9,6 +9,7 @@ wgpu = { version = "24", default-features = false, features = ["wgsl", "dx12"] }
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
 pollster = "0.4"
+rfd = { version = "0.15", default-features = false }
 
 [profile.release]
 opt-level = 3
