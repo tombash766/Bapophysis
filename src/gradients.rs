@@ -62,6 +62,24 @@ fn hsv(h: f32, s: f32, v: f32) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], 1.]
 }
 pub fn random(seed: u32) -> Palette {
+    random_with(seed, &RandomOptions::default())
+}
+#[derive(Clone, Copy)]
+pub struct RandomOptions {
+    pub hue: f32,
+    pub hue_range: f32,
+    pub saturation: f32,
+}
+impl Default for RandomOptions {
+    fn default() -> Self {
+        Self {
+            hue: 210.,
+            hue_range: 360.,
+            saturation: 1.,
+        }
+    }
+}
+pub fn random_with(seed: u32, options: &RandomOptions) -> Palette {
     let mut state = seed.max(1);
     let mut unit = || {
         state ^= state << 13;
@@ -75,13 +93,18 @@ pub fn random(seed: u32) -> Palette {
     let mut hue = unit();
     for i in 0..count {
         hue = (hue + 0.13 + unit() * 0.65) % 1.;
-        let saturation = 0.65 + unit() * 0.35;
+        let selected_hue = if options.hue_range >= 360. {
+            hue
+        } else {
+            options.hue / 360. + (hue - 0.5) * options.hue_range.clamp(0., 360.) / 360.
+        };
+        let saturation = (0.65 + unit() * 0.35) * options.saturation.clamp(0., 1.);
         let value = if i % 7 == 0 {
             0.06 + unit() * 0.15
         } else {
             0.55 + unit() * 0.45
         };
-        stops.push((position, hsv(hue, saturation, value)));
+        stops.push((position, hsv(selected_hue, saturation, value)));
         position += 0.25 + unit() * 1.75;
     }
     let end = stops.last().unwrap().0;
@@ -107,6 +130,43 @@ pub fn sample(palette: &Palette, position: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restricted_gradients_keep_hue_and_brightness_variation() {
+        let options = RandomOptions {
+            hue: 0.,
+            hue_range: 0.,
+            saturation: 1.,
+        };
+        let p = random_with(123, &options);
+        assert_eq!(p, random_with(123, &options));
+        assert!(p
+            .iter()
+            .all(|c| c[0] >= c[1] && (c[1] - c[2]).abs() < 0.00001));
+        assert!(p.iter().any(|c| c[0] < 0.25));
+        assert!(p.iter().any(|c| c[0] > 0.7));
+        let grey = random_with(
+            123,
+            &RandomOptions {
+                saturation: 0.,
+                ..options
+            },
+        );
+        assert!(grey.iter().all(|c| c[0] == c[1] && c[1] == c[2]));
+        let narrow = random_with(
+            456,
+            &RandomOptions {
+                hue: 0.,
+                hue_range: 30.,
+                saturation: 1.,
+            },
+        );
+        for c in narrow {
+            let min = c[0].min(c[1]).min(c[2]);
+            let chroma = c[0] - min;
+            let hue = 60. * (c[1] - c[2]) / chroma;
+            assert!(hue.abs() <= 15.001);
+        }
+    }
     #[test]
     fn gradients_have_distinct_colours_and_valid_endpoints() {
         for id in 1..NAMES.len() {

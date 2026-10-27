@@ -357,15 +357,20 @@ pub fn generate(seed: u32) -> Flame {
 }
 pub fn generate_with(seed: u32, options: &crate::settings::GenerationOptions) -> Flame {
     assert!(options.valid(), "At least one variation must be enabled");
-    let mut rng = Random(seed);
+    // Batch seeds are consecutive RNG states. Mix each seed before searching so
+    // rejected candidates cannot make neighbouring searches converge on one flame.
+    let mut mixed = seed.wrapping_add(0x9e3779b9);
+    mixed = (mixed ^ (mixed >> 16)).wrapping_mul(0x85ebca6b);
+    mixed = (mixed ^ (mixed >> 13)).wrapping_mul(0xc2b2ae35);
+    let mut rng = Random(mixed ^ (mixed >> 16));
     for _ in 0..64 {
         let mut flame = candidate(rng.next(), options);
         if fit(&mut flame) {
             return flame;
         }
     }
-    // Deterministic known-good search avoids returning a blank candidate.
-    let mut flame = candidate(13579, options);
+    // Keep the fallback specific to this request rather than repeating one flame.
+    let mut flame = candidate(rng.next(), options);
     if !fit(&mut flame) {
         flame.camera = [0., 0., 5., 5.];
     }
@@ -421,6 +426,23 @@ pub fn image_bytes<T: Copy + Into<u64>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consecutive_batch_seeds_produce_distinct_fractals() {
+        for start in [1, 12345, 987654321] {
+            let mut rng = Random(start);
+            let mut flames: Vec<Flame> = Vec::new();
+            for _ in 0..48 {
+                let flame = generate(rng.next());
+                assert!(
+                    flames
+                        .iter()
+                        .all(|previous| previous.transforms != flame.transforms),
+                    "Repeated geometry in batch starting with {start}"
+                );
+                flames.push(flame);
+            }
+        }
+    }
     #[test]
     fn all_variation_subsets_are_respected() {
         let masks = (1u64..32).chain((0..crate::settings::VARIATION_COUNT).map(|i| 1u64 << i));

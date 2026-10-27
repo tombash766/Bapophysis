@@ -1,4 +1,37 @@
 pub const VARIATION_COUNT: usize = 40;
+fn parse_iteration_target(text: &str) -> Option<u64> {
+    text.trim()
+        .parse()
+        .ok()
+        .filter(|n| (1..=10_000_000_000).contains(n))
+}
+pub fn load_iteration_target() -> u64 {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p.with_file_name("iteration-target.txt")).ok())
+        .and_then(|s| parse_iteration_target(&s))
+        .unwrap_or(32_000_000)
+}
+pub fn save_iteration_target(target: u64) -> Result<(), String> {
+    let path = settings_path()
+        .ok_or("Could not find settings folder")?
+        .with_file_name("iteration-target.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(path, target.clamp(1, 10_000_000_000).to_string()).map_err(|e| e.to_string())
+}
+pub fn load_render_batches() -> u32 {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p.with_file_name("render-batches.txt")).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+pub fn save_render_batches(batches: u32) -> Result<(), String> {
+    let path = settings_path()
+        .ok_or("Could not find settings folder")?
+        .with_file_name("render-batches.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(path, batches.clamp(1, 32).to_string()).map_err(|e| e.to_string())
+}
 pub const VARIATIONS: [(&str, &str); VARIATION_COUNT] = [
     ("Linear", "Straight affine transformations"),
     ("Sinusoidal", "Waves and bounded folds"),
@@ -60,6 +93,9 @@ impl GenerationOptions {
         let Some(path) = settings_path() else {
             return Self::default();
         };
+        Self::load_from(&path)
+    }
+    fn load_from(path: &std::path::Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|s| Self::parse(s.trim()))
@@ -79,6 +115,9 @@ impl GenerationOptions {
     }
     pub fn save(&self) -> Result<(), String> {
         let path = settings_path().ok_or("Could not find the local settings folder")?;
+        self.save_to(&path)
+    }
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         let text: String = self
             .enabled
@@ -98,6 +137,24 @@ fn settings_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn iteration_targets_restore_custom_values_and_reject_invalid_settings() {
+        assert_eq!(parse_iteration_target(" 640000000\n"), Some(640_000_000));
+        for text in ["", "oops", "0", "-1", "10000000001"] {
+            assert_eq!(parse_iteration_target(text), None);
+        }
+    }
+    #[test]
+    fn enabled_variations_survive_save_and_reload() {
+        let path =
+            std::env::temp_dir().join(format!("bapophysis-variations-{}.txt", std::process::id()));
+        let options = GenerationOptions {
+            enabled: std::array::from_fn(|i| i % 3 == 0),
+        };
+        options.save_to(&path).unwrap();
+        assert_eq!(GenerationOptions::load_from(&path).enabled, options.enabled);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn invalid_preferences_fall_back_safely() {
         for text in ["", "00000", "111", "abcde", "111111"] {

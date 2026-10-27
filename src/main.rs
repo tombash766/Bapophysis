@@ -11,7 +11,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SIZE: u32 = 768;
 const THUMB: u32 = 160;
-const SAMPLE_LIMIT: u64 = 32_000_000;
 struct Preview {
     flame: Flame,
     texture: Option<egui::TextureHandle>,
@@ -19,7 +18,6 @@ struct Preview {
     original_palette: gradients::Palette,
     base_palette: gradients::Palette,
     rotation: usize,
-    target: u64,
 }
 const EXPORT_BATCHES: u32 = 8;
 struct ExportJob {
@@ -44,10 +42,15 @@ struct App {
     thumbnail_job: Option<(u64, usize)>,
     rng: Random,
     camera: [f32; 4],
+    render_camera: [f32; 4],
+    texture_camera: [f32; 4],
     dirty: bool,
     running: bool,
     samples: u64,
     pixels: Vec<[u64; 4]>,
+    preview_batches: u32,
+    pending_preview_batches: u32,
+    iteration_target: u64,
     texture: Option<egui::TextureHandle>,
     exposure: f32,
     render_size: [u32; 2],
@@ -55,6 +58,7 @@ struct App {
     preferences_open: bool,
     gradient_open: bool,
     gradient_batch: u32,
+    gradient_options: gradients::RandomOptions,
     options: settings::GenerationOptions,
     export_options: settings::ExportOptions,
     export_job: Option<ExportJob>,
@@ -82,10 +86,15 @@ impl App {
             thumbnail_job: None,
             rng: Random(seed),
             camera: [0., 0., 5., 5.],
+            render_camera: [0., 0., 5., 5.],
+            texture_camera: [0., 0., 5., 5.],
             dirty: true,
             running: true,
             samples: 0,
             pixels: vec![[0; 4]; (SIZE * SIZE) as usize],
+            preview_batches: settings::load_render_batches(),
+            pending_preview_batches: 1,
+            iteration_target: settings::load_iteration_target(),
             texture: None,
             exposure: 1.,
             render_size: [SIZE, SIZE],
@@ -93,6 +102,7 @@ impl App {
             preferences_open: false,
             gradient_open: false,
             gradient_batch: seed,
+            gradient_options: gradients::RandomOptions::default(),
             options: settings::GenerationOptions::load(),
             export_options: settings::ExportOptions::load(),
             export_job: None,
@@ -113,7 +123,6 @@ impl App {
                     flame,
                     texture: None,
                     gradient: 0,
-                    target: SAMPLE_LIMIT,
                 }
             })
             .collect();
@@ -125,12 +134,14 @@ impl App {
         self.camera = self.previews[index].flame.camera;
         self.camera[2] = self.camera[3] * self.render_size[0] as f32 / self.render_size[1] as f32;
         self.texture = self.previews[index].texture.clone();
+        self.texture_camera = self.camera;
         self.dirty = true;
         self.running = true;
         self.samples = 0;
         self.pixels.fill([0; 4]);
     }
     fn update_texture(&mut self, ctx: &egui::Context) {
+        self.texture_camera = self.render_camera;
         let image = egui::ColorImage::from_rgb(
             [self.render_size[0] as usize, self.render_size[1] as usize],
             &colours(&self.pixels, self.exposure),
@@ -141,10 +152,10 @@ impl App {
             .as_mut()
             .filter(|t| t.size() == [self.render_size[0] as usize, self.render_size[1] as usize])
         {
-            texture.set(image, egui::TextureOptions::LINEAR);
+            texture.set(image, egui::TextureOptions::NEAREST);
         } else {
             self.texture =
-                Some(ctx.load_texture("Selected flame", image, egui::TextureOptions::LINEAR));
+                Some(ctx.load_texture("Selected flame", image, egui::TextureOptions::NEAREST));
         }
     }
     fn change_gradient(&mut self, id: usize) {
@@ -173,18 +184,28 @@ impl App {
     fn random_gradient(&mut self, seed: u32) {
         let p = &mut self.previews[self.selected];
         p.gradient = gradients::NAMES.len();
-        p.base_palette = gradients::random(seed);
+        p.base_palette = gradients::random_with(seed, &self.gradient_options);
         p.rotation = 0;
         self.refresh_gradient();
     }
     fn gradient_popup(&mut self, ctx: &egui::Context) {
+        if !self.gradient_open {
+            return;
+        }
         let mut open = self.gradient_open;
-        egui::Window::new("Gradient")
-            .open(&mut open)
-            .default_width(440.)
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("gradient window"),
+            egui::ViewportBuilder::default()
+                .with_title("Bapophysis — Gradient")
+                .with_inner_size([480., 680.])
+                .with_min_inner_size([460., 400.])
+                .with_window_level(egui::WindowLevel::Normal),
+            |ctx, _| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().id_salt("gradient content").show(ui, |ui| {
                 ui.label(format!("Colours for fractal #{:02}", self.selected + 1));
                 ui.small("Changes apply only to this fractal and its thumbnail.");
                 if let Some(texture) = &self.texture {
@@ -204,6 +225,12 @@ impl App {
                 {
                     self.refresh_gradient();
                 }
+                ui.separator();
+                ui.label("Random gradient settings");
+                ui.add(egui::Slider::new(&mut self.gradient_options.hue_range, 0.0..=360.0).text("Hue range (degrees)"));
+                ui.add_enabled(self.gradient_options.hue_range < 360., egui::Slider::new(&mut self.gradient_options.hue, 0.0..=360.0).text("Centre hue (degrees)"));
+                ui.add(egui::Slider::new(&mut self.gradient_options.saturation, 0.0..=1.0).text("Saturation"));
+                ui.small("0° range = one hue; 360° = all hues. Settings affect new random gradients and the choices below.");
                 ui.horizontal(|ui| {
                     if ui.button("New random gradient").clicked() {
                         let seed = self.rng.next();
@@ -240,14 +267,17 @@ impl App {
                     .show(ui, |ui| {
                         for i in 0..10u32 {
                             let seed = self.gradient_batch.wrapping_add(i.wrapping_mul(747796405));
-                            let palette = gradients::random(seed);
+                            let palette = gradients::random_with(seed, &self.gradient_options);
                             if gradient_strip(ui, &palette, egui::vec2(420., 22.)).clicked() {
                                 self.random_gradient(seed);
                             }
                             ui.add_space(3.);
                         }
                     });
-            });
+                });
+                });
+            },
+        );
         self.gradient_open = open;
     }
     fn collect(&mut self, ctx: &egui::Context) {
@@ -302,6 +332,7 @@ impl App {
                             );
                             if index == self.selected && self.samples == 0 {
                                 self.texture = Some(texture.clone());
+                                self.texture_camera = self.previews[index].flame.camera;
                             }
                             self.previews[index].texture = Some(texture);
                         }
@@ -315,8 +346,8 @@ impl App {
                 Ok(pixels) if !self.dirty => {
                     accumulate(&mut self.pixels, &pixels);
                     self.detail.clear_histogram();
-                    self.samples += (PARTICLES * 32) as u64;
-                    if self.samples >= self.previews[self.selected].target {
+                    self.samples += (PARTICLES * 32 * self.pending_preview_batches) as u64;
+                    if self.samples >= self.iteration_target {
                         self.running = false;
                     }
                     self.update_texture(ctx);
@@ -356,12 +387,14 @@ impl App {
                     .params(self.render_size[0], self.render_size[1]);
                 p.camera = self.camera;
                 self.detail.reset(&p);
+                self.render_camera = self.camera;
                 self.pixels = vec![[0; 4]; (self.render_size[0] * self.render_size[1]) as usize];
                 self.dirty = false;
             }
-            if self.running && self.samples < self.previews[self.selected].target {
-                self.detail.dispatch();
-            } else if self.samples >= self.previews[self.selected].target {
+            if self.running && self.samples < self.iteration_target {
+                self.pending_preview_batches = self.preview_batches;
+                self.detail.dispatch_batches(self.pending_preview_batches);
+            } else if self.samples >= self.iteration_target {
                 self.running = false;
             }
         }
@@ -414,7 +447,7 @@ impl App {
                 samples: 0,
                 target: ((size[0] as u64 * size[1] as u64) * 32)
                     .clamp(8_000_000, 64_000_000)
-                    .max(self.previews[self.selected].target),
+                    .max(self.iteration_target),
                 exposure: self.exposure,
                 seed,
                 transparent: self.export_options.transparent,
@@ -424,14 +457,37 @@ impl App {
         }
     }
     fn preferences(&mut self, ctx: &egui::Context) {
+        if !self.preferences_open {
+            return;
+        }
         let mut open = self.preferences_open;
         let mut generate = false;
-        egui::Window::new("Preferences")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("preferences window"),
+            egui::ViewportBuilder::default()
+                .with_title("Bapophysis — Preferences")
+                .with_inner_size([500., 650.])
+                .with_min_inner_size([420., 400.])
+                .with_window_level(egui::WindowLevel::Normal),
+            |ctx, _| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().id_salt("preferences content").show(ui, |ui| {
+                ui.heading("Rendering performance");
+                if ui.add(egui::Slider::new(&mut self.preview_batches, 1..=32)
+                    .text("GPU batch size")).changed() {
+                    if let Err(e) = settings::save_render_batches(self.preview_batches) {
+                        self.status = format!("Could not remember rendering settings: {e}");
+                    }
+                }
+                ui.small(format!("{} iterations per preview update", self.preview_batches * PARTICLES * 32));
+                ui.small("Lower: smoother interaction and more frequent updates. Higher: less transfer overhead, but longer waits between updates. Final quality is controlled by the iteration target.");
+                ui.separator();
                 ui.heading("Random generation");
+                ui.add(egui::Slider::new(&mut self.batch_size, 1..=48).text("Flames per batch"));
+                ui.small("Applies to the next batch. Smaller galleries generate fewer thumbnails.");
                 ui.label("Choose which variations may appear in new flames.");
                 ui.small("Affine positioning is always applied before the chosen variation.");
                 let mut changed = false;
@@ -475,7 +531,7 @@ impl App {
                                 }
                             });
                     });
-                ui.small("Keep at least one enabled. Existing previews stay unchanged.");
+                ui.small("Keep at least one enabled. Choices are saved automatically and restored on launch. Existing previews stay unchanged.");
                 if changed {
                     if let Err(e) = self.options.save() {
                         self.status =
@@ -541,7 +597,10 @@ impl App {
                 if ui.button("Generate a new batch").clicked() {
                     generate = true;
                 }
-            });
+                });
+                });
+            },
+        );
         self.preferences_open = open;
         if generate {
             self.new_batch();
@@ -549,15 +608,18 @@ impl App {
         }
     }
 }
-fn viewport_resolution(available: egui::Vec2) -> [u32; 2] {
-    let scale = SIZE as f32 / available.x.max(available.y).max(1.);
+fn viewport_resolution(available: egui::Vec2, pixels_per_point: f32) -> [u32; 2] {
+    // Render at physical window resolution, bounded by the supported GPU buffer size.
+    let physical = available * pixels_per_point;
+    let scale = (2048. / physical.x.max(physical.y).max(1.)).min(1.);
     [
-        (available.x * scale).round().clamp(1., SIZE as f32) as u32,
-        (available.y * scale).round().clamp(1., SIZE as f32) as u32,
+        (physical.x * scale).round().clamp(1., 2048.) as u32,
+        (physical.y * scale).round().clamp(1., 2048.) as u32,
     ]
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        let previous_target = self.iteration_target;
         self.collect(ctx);
         egui::SidePanel::left("gallery")
             .exact_width(270.)
@@ -647,13 +709,10 @@ impl eframe::App for App {
                     self.gradient_open = true;
                 }
                 if ui
-                    .button(if self.running { "Pause" } else { "Refine" })
+                    .add_enabled(self.samples < self.iteration_target,
+                        egui::Button::new(if self.running { "Pause" } else { "Resume" }))
                     .clicked()
                 {
-                    if self.samples >= self.previews[self.selected].target {
-                        self.previews[self.selected].target =
-                            (self.samples + 128_000_000).min(10_000_000_000);
-                    }
                     self.running = !self.running;
                 }
                 if ui.button("Fit view").clicked() {
@@ -668,33 +727,32 @@ impl eframe::App for App {
                     [125., 18.],
                     egui::Label::new(format!("{:.1}M iterations", self.samples as f64 / 1e6)),
                 );
-                let old_target = self.previews[self.selected].target;
+                let old_target = self.iteration_target;
                 egui::ComboBox::from_id_salt("iteration target")
                     .width(120.)
-                    .selected_text(format!("Target {}M", old_target / 1_000_000))
+                    .selected_text("Iteration presets")
                     .show_ui(ui, |ui| {
                         for target in [32_000_000, 128_000_000, 512_000_000, 1_024_000_000] {
                             ui.selectable_value(
-                                &mut self.previews[self.selected].target,
+                                &mut self.iteration_target,
                                 target,
                                 format!("{} million", target / 1_000_000),
                             );
                         }
                     });
-                if self.previews[self.selected].target != old_target
-                    && self.samples < self.previews[self.selected].target
-                {
-                    self.running = true;
+                ui.label("Target (millions):");
+                let mut millions = self.iteration_target as f64 / 1_000_000.;
+                if ui.add(egui::DragValue::new(&mut millions)
+                    .range(0.000001..=10_000.)
+                    .speed(1.)
+                    .max_decimals(6)
+                    .update_while_editing(false))
+                    .on_hover_text("Type millions of iterations: 1500 = 1.5 billion. Maximum 10,000 million. Press Enter to apply.")
+                    .changed() {
+                    self.iteration_target = (millions * 1_000_000.).round() as u64;
                 }
-                if ui
-                    .button("+128M")
-                    .on_hover_text("Keep existing samples and add another 128 million iterations")
-                    .clicked()
-                {
-                    self.previews[self.selected].target =
-                        (self.previews[self.selected].target.max(self.samples) + 128_000_000)
-                            .min(10_000_000_000);
-                    self.running = true;
+                if self.iteration_target != old_target {
+                    self.running = self.samples < self.iteration_target;
                 }
                 if ui
                     .add(egui::Slider::new(&mut self.exposure, 0.3..=2.5).text("Exposure"))
@@ -747,49 +805,54 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_size().max(egui::vec2(1., 1.));
-            let size = viewport_resolution(available);
+            let size = viewport_resolution(available, ctx.pixels_per_point());
             if size != self.render_size {
                 self.render_size = size;
                 self.camera[2] = self.camera[3] * size[0] as f32 / size[1] as f32;
                 self.samples = 0;
                 self.dirty = true;
                 self.running = true;
-                self.texture = None;
             }
-            if let Some(texture) = &self.texture {
-                let response = ui.add(
-                    egui::Image::new(texture)
-                        .fit_to_exact_size(available)
-                        .sense(egui::Sense::drag()),
-                );
-                if response.dragged() {
-                    let delta = ctx.input(|i| i.pointer.delta());
-                    self.camera[0] -= delta.x / available.x * self.camera[2];
-                    self.camera[1] += delta.y / available.y * self.camera[3];
+            let (view, response) = ui.allocate_exact_size(available, egui::Sense::drag());
+            if response.dragged() {
+                let delta = ctx.input(|i| i.pointer.delta());
+                self.camera[0] -= delta.x / available.x * self.camera[2];
+                self.camera[1] += delta.y / available.y * self.camera[3];
+                self.dirty = true;
+                self.samples = 0;
+                self.running = true;
+            }
+            if response.hovered() {
+                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0. {
+                    let extent = (self.camera[3] * (-scroll * 0.002).exp()).clamp(0.001, 1000.);
+                    self.camera[2] =
+                        extent * self.render_size[0] as f32 / self.render_size[1] as f32;
+                    self.camera[3] = extent;
                     self.dirty = true;
                     self.samples = 0;
                     self.running = true;
                 }
-                if response.hovered() {
-                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0. {
-                        let extent = (self.camera[3] * (-scroll * 0.002).exp()).clamp(0.001, 1000.);
-                        self.camera[2] =
-                            extent * self.render_size[0] as f32 / self.render_size[1] as f32;
-                        self.camera[3] = extent;
-                        self.dirty = true;
-                        self.samples = 0;
-                        self.running = true;
-                    }
-                }
+            }
+            if let Some(texture) = &self.texture {
+                let image = reproject_preview(view, self.texture_camera, self.camera);
+                ui.painter().with_clip_rect(view).image(
+                    texture.id(),
+                    image,
+                    egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
+                    egui::Color32::WHITE,
+                );
             } else {
-                ui.centered_and_justified(|ui| {
-                    ui.spinner();
-                });
+                ui.put(view, egui::Spinner::new());
             }
         });
         self.preferences(ctx);
         self.gradient_popup(ctx);
+        if self.iteration_target != previous_target {
+            if let Err(e) = settings::save_iteration_target(self.iteration_target) {
+                self.status = format!("Could not remember iteration target: {e}");
+            }
+        }
         self.schedule();
         if self.running
             || self.export_job.is_some()
@@ -800,6 +863,20 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
+}
+fn reproject_preview(view: egui::Rect, source: [f32; 4], camera: [f32; 4]) -> egui::Rect {
+    let centre = view.center()
+        + egui::vec2(
+            (source[0] - camera[0]) / camera[2] * view.width(),
+            (camera[1] - source[1]) / camera[3] * view.height(),
+        );
+    egui::Rect::from_center_size(
+        centre,
+        egui::vec2(
+            view.width() * source[2] / camera[2],
+            view.height() * source[3] / camera[3],
+        ),
+    )
 }
 fn accumulate(total: &mut [[u64; 4]], batch: &[[u32; 4]]) {
     assert_eq!(total.len(), batch.len());
@@ -1055,9 +1132,35 @@ fn write_png_rect(path: &str, width: u32, height: u32, pixels: &[[u32; 4]]) {
 mod viewport_tests {
     use super::*;
     #[test]
+    fn navigation_preview_tracks_pan_zoom_and_clipping() {
+        let view = egui::Rect::from_min_size(egui::pos2(10., 20.), egui::vec2(800., 600.));
+        let source = [0., 0., 8., 6.];
+        assert_eq!(reproject_preview(view, source, source), view);
+        let pan = reproject_preview(view, source, [1., 1., 8., 6.]);
+        assert_eq!(pan.min, view.min + egui::vec2(-100., 100.));
+        let zoom = reproject_preview(view, source, [0., 0., 4., 3.]);
+        assert_eq!(zoom.center(), view.center());
+        assert_eq!(zoom.size(), view.size() * 2.);
+        assert_eq!(zoom.intersect(view), view);
+    }
+    #[test]
     fn rectangular_resolution_fills_view_with_bounded_pixel_cost() {
-        assert_eq!(viewport_resolution(egui::vec2(1200., 600.)), [768, 384]);
-        assert_eq!(viewport_resolution(egui::vec2(600., 1200.)), [384, 768]);
+        assert_eq!(
+            viewport_resolution(egui::vec2(1200., 600.), 1.),
+            [1200, 600]
+        );
+        assert_eq!(
+            viewport_resolution(egui::vec2(600., 1200.), 1.),
+            [600, 1200]
+        );
+        assert_eq!(
+            viewport_resolution(egui::vec2(800., 600.), 2.),
+            [1600, 1200]
+        );
+        assert_eq!(
+            viewport_resolution(egui::vec2(2400., 1200.), 1.),
+            [2048, 1024]
+        );
     }
     #[test]
     fn export_resolution_and_camera_preserve_view() {
